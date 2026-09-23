@@ -6,6 +6,7 @@ package taskpool
 
 import (
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -17,32 +18,74 @@ type TaskPool struct {
 	concurrent    int64
 	maxConcurrent int64
 	chQqueue      chan func()
+	chSlot        chan struct{}
 	chClose       chan struct{}
+	stopOnce      sync.Once
 	caller        func(f func())
+}
+
+// acquire tries to take a worker slot.
+//
+//go:norace
+func (tp *TaskPool) acquire() bool {
+	if atomic.AddInt64(&tp.concurrent, 1) <= tp.maxConcurrent {
+		return true
+	}
+	atomic.AddInt64(&tp.concurrent, -1)
+	return false
+}
+
+// release gives back a worker slot and wakes up the dispatcher if it's waiting.
+//
+//go:norace
+func (tp *TaskPool) release() {
+	atomic.AddInt64(&tp.concurrent, -1)
+	select {
+	case tp.chSlot <- struct{}{}:
+	default:
+	}
 }
 
 // fork .
 //
 //go:norace
 func (tp *TaskPool) fork(f func()) bool {
-	if atomic.AddInt64(&tp.concurrent, 1) < tp.maxConcurrent {
-		go func() {
-			defer atomic.AddInt64(&tp.concurrent, -1)
+	if !tp.acquire() {
+		return false
+	}
+	go func() {
+		defer tp.release()
+		for {
 			tp.caller(f)
-			for {
+			select {
+			case f = <-tp.chQqueue:
+			default:
+				return
+			}
+		}
+	}()
+	return true
+}
+
+// dispatch moves queued tasks to workers. It never executes tasks itself,
+// so a blocking task can't stop the queue from being consumed.
+//
+//go:norace
+func (tp *TaskPool) dispatch() {
+	for {
+		select {
+		case f := <-tp.chQqueue:
+			for !tp.fork(f) {
 				select {
-				case f = <-tp.chQqueue:
-					if f != nil {
-						tp.caller(f)
-					}
-				default:
+				case <-tp.chSlot:
+				case <-tp.chClose:
 					return
 				}
 			}
-		}()
-		return true
+		case <-tp.chClose:
+			return
+		}
 	}
-	return false
 }
 
 // Call .
@@ -56,6 +99,10 @@ func (tp *TaskPool) Call(f func()) {
 //
 //go:norace
 func (tp *TaskPool) Go(f func()) {
+	if f == nil {
+		return
+	}
+
 	// If current goroutine num is less than maxConcurrent,
 	// creat a new goroutine to exec new task.
 	if tp.fork(f) {
@@ -63,7 +110,6 @@ func (tp *TaskPool) Go(f func()) {
 	}
 
 	// Else push the new task into chan/queue.
-	atomic.AddInt64(&tp.concurrent, -1)
 	select {
 	case tp.chQqueue <- f:
 	case <-tp.chClose:
@@ -74,17 +120,23 @@ func (tp *TaskPool) Go(f func()) {
 //
 //go:norace
 func (tp *TaskPool) Stop() {
-	atomic.AddInt64(&tp.concurrent, tp.maxConcurrent)
-	close(tp.chClose)
+	tp.stopOnce.Do(func() {
+		atomic.AddInt64(&tp.concurrent, tp.maxConcurrent)
+		close(tp.chClose)
+	})
 }
 
 // New creates and returns a TaskPool.
 //
 //go:norace
 func New(maxConcurrent int, chQqueueSize int, v ...interface{}) *TaskPool {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1
+	}
 	tp := &TaskPool{
-		maxConcurrent: int64(maxConcurrent - 1),
+		maxConcurrent: int64(maxConcurrent),
 		chQqueue:      make(chan func(), chQqueueSize),
+		chSlot:        make(chan struct{}, 1),
 		chClose:       make(chan struct{}),
 	}
 	tp.caller = func(f func()) {
@@ -100,27 +152,9 @@ func New(maxConcurrent int, chQqueueSize int, v ...interface{}) *TaskPool {
 	}
 	if len(v) > 0 {
 		if caller, ok := v[0].(func(f func())); ok {
-			tp.caller = func(f func()) {
-				defer atomic.AddInt64(&tp.concurrent, -1)
-				caller(f)
-			}
+			tp.caller = caller
 		}
 	}
-	go func() {
-		for {
-			select {
-			case f := <-tp.chQqueue:
-				if tp.fork(f) {
-					continue
-				}
-
-				if f != nil {
-					tp.caller(f)
-				}
-			case <-tp.chClose:
-				return
-			}
-		}
-	}()
+	go tp.dispatch()
 	return tp
 }
